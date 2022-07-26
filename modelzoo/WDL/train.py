@@ -322,33 +322,27 @@ def build_model_input(filename, batch_size, num_epochs):
     df[CONTINUOUS_COLUMNS] = df[CONTINUOUS_COLUMNS].fillna(0.0)
     df[CATEGORICAL_COLUMNS] = df[CATEGORICAL_COLUMNS].fillna(' ')
     features = collections.OrderedDict()
-    output_types = collections.OrderedDict()
+    features_placeholder = collections.OrderedDict()
     for col in CONTINUOUS_COLUMNS:
-        features[col] = df[col].to_numpy().astype(np.float32)
-        output_types[col] = tf.float32
+        col_ph = tf.placeholder(tf.float32)
+        features_placeholder[col] = col_ph
+        features[col_ph] = df[col].to_numpy().astype(np.float32)
     import hashlib
     for col in CATEGORICAL_COLUMNS:
-        df[col] = df[col].apply(lambda x: int(hashlib.md5(str(x).encode('utf_8')).hexdigest(), 16) % 10000)
-        output_types[col] = tf.int32
-        features[col] = df[col].to_numpy().astype(np.int32)
+        col_ph = tf.placeholder(tf.string)
+        features_placeholder[col] = col_ph
+        # df[col] = df[col].apply(lambda x: int(hashlib.md5(str(x).encode('utf_8')).hexdigest(), 16) % 10000)
+        features[col_ph] = df[col].to_numpy()
         # features[col] = df[col].to_numpy()
         # output_types[col] = tf.string
-    labels = df[LABEL_COLUMN[0]].to_numpy().astype(np.int32)
+    # labels = df[LABEL_COLUMN[0]].to_numpy().astype(np.int32)
+    labels_ph = tf.placeholder(tf.int32)
+    features[labels_ph] = df[LABEL_COLUMN[0]].to_numpy().astype(np.int32)
     print(df.head(5))
-    dataset = tf.data.Dataset.from_tensor_slices((features, labels))
+    dataset = tf.data.Dataset.from_tensor_slices((features_placeholder, labels_ph))
+    print(features_placeholder)
+    print(labels_ph)
 
-    # def get_item():
-    #     i = 0
-    #     size = len(labels)
-    #     while i < size:
-    #         single_features = collections.OrderedDict()
-    #         for k, v in features.items():
-    #             single_features[k] = v[i]
-    #         single_label = labels[i]
-    #         yield single_features, single_label
-    #         i += 1
-    #
-    # dataset = tf.data.Dataset.from_generator(get_item, output_types=(output_types, tf.int32))
     dataset = dataset.shuffle(buffer_size=20000,
                               seed=args.seed)  # fix seed for reproducing
     dataset = dataset.repeat(num_epochs)
@@ -356,7 +350,7 @@ def build_model_input(filename, batch_size, num_epochs):
     dataset = dataset.batch(batch_size)
     # dataset = dataset.map(parse_csv, num_parallel_calls=28)
     dataset = dataset.prefetch(2)
-    return dataset
+    return dataset, features
 
 
 # generate feature columns
@@ -380,10 +374,10 @@ def build_feature_columns():
     wide_columns = []
     for column_name in FEATURE_COLUMNS:
         if column_name in CATEGORICAL_COLUMNS:
-            # categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
-            #     column_name, hash_bucket_size=10000, dtype=tf.string)
-            categorical_column = tf.feature_column.categorical_column_with_identity(
-                column_name, num_buckets=10000)
+            categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
+                column_name, hash_bucket_size=10000, dtype=tf.string)
+            # categorical_column = tf.feature_column.categorical_column_with_identity(
+            #     column_name, num_buckets=10000)
             wide_columns.append(categorical_column)
 
             if not args.tf:
@@ -464,17 +458,22 @@ def build_feature_columns():
 def train(sess_config,
           input_hooks,
           model,
-          data_init_op,
+          dataset,
           steps,
           checkpoint_dir,
           tf_config=None,
-          server=None):
+          server=None,
+          train_feed_dict=None):
     model.is_training = True
     hooks = []
     hooks.extend(input_hooks)
 
+    itr = dataset.make_initializable_iterator()
+
     scaffold = tf.train.Scaffold(
-        local_init_op=tf.group(tf.local_variables_initializer(), data_init_op),
+        init_op=itr.initializer,
+        local_init_op=tf.local_variables_initializer(),
+        init_feed_dict=train_feed_dict,
         saver=tf.train.Saver(max_to_keep=args.keep_checkpoint_max))
 
     stop_hook = tf.train.StopAtStepHook(last_step=steps)
@@ -502,6 +501,12 @@ def train(sess_config,
         print("Please see the comments in the code.")
         sys.exit()
 
+
+    # with tf.Session() as sess:
+    #     # Feed the data when initializing the iterator
+    #     sess.run(itr.initializer, feed_dict=train_feed_dict)
+    #     print(sess.run(itr.get_next()))
+
     print("Start creating session......")
     session_start = time.time()
     with tf.train.MonitoredTrainingSession(
@@ -514,8 +519,11 @@ def train(sess_config,
             summary_dir=checkpoint_dir,
             save_summaries_steps=args.save_steps,
             config=sess_config) as sess:
+    # with tf.Session() as sess:
         session_end = time.time()
         print("Session creation time: ", session_end - session_start)
+        # sess.run(itr.initializer, feed_dict=train_feed_dict)
+        # print(sess.run(itr.get_next()))
         while not sess.should_stop():
             sess.run([model.loss, model.train_op])
     print("Training completed.")
@@ -588,15 +596,25 @@ def main(tf_config=None, server=None):
     print("Saving model checkpoints to " + checkpoint_dir)
 
     # create data pipline of train & test dataset
-    train_dataset = build_model_input(train_file, batch_size, no_of_epochs)
-    test_dataset = build_model_input(test_file, batch_size, 1)
+    train_dataset, train_feed_dict = build_model_input(train_file, batch_size, no_of_epochs)
+    test_dataset, test_feed_dict = build_model_input(test_file, batch_size, 1)
+
+    # train_iter = train_dataset.make_initializable_iterator()
+    # test_iter = test_dataset.make_initializable_iterator()
+
+    # with tf.Session() as sess:
+    #     # Feed the data when initializing the iterator
+    #     sess.run(train_iter.initializer, feed_dict=train_feed_dict)
+    #     sess.run(test_iter.initializer, feed_dict=test_feed_dict)
+    #     print(sess.run(train_iter.get_next()))
 
     iterator = tf.data.Iterator.from_structure(train_dataset.output_types,
                                                test_dataset.output_shapes)
     next_element = iterator.get_next()
-
-    train_init_op = iterator.make_initializer(train_dataset)
-    test_init_op = iterator.make_initializer(test_dataset)
+    # train_init_op = iterator.make_initializer(train_dataset)
+    # test_init_op = iterator.make_initializer(test_dataset)
+    # train_init_op = train_iter.initializer
+    # test_init_op = test_iter.initializer
 
     # create feature column
     wide_column, deep_column = build_feature_columns()
@@ -646,8 +664,8 @@ def main(tf_config=None, server=None):
                 dense_layer_partitioner=dense_layer_partitioner)
 
     # Run model training and evaluation
-    train(sess_config, hooks, model, train_init_op, train_steps,
-          checkpoint_dir, tf_config, server)
+    train(sess_config, hooks, model, train_dataset, train_steps,
+          checkpoint_dir, tf_config, server, train_feed_dict)
     if not (args.no_eval or tf_config):
         eval(sess_config, hooks, model, test_init_op, test_steps,
              checkpoint_dir)
